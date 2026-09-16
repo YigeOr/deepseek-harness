@@ -6,6 +6,7 @@
  * @module @deepseek-ai/dsh-llm/assembler
  */
 
+import { randomUUID } from 'node:crypto'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import type { ToolCallId } from './brand.ts'
@@ -19,6 +20,8 @@ interface PartialBlock {
   toolCallId?: ToolCallId
   toolCallName?: string
   toolCallArguments: string
+  /** Anonymous identity minted once when the provider never supplied a usable tool-call id. */
+  anonId?: ToolCallId
   /** Set by `block-end` — authoritative, and freezes the partial. */
   block?: ContentBlock
 }
@@ -69,7 +72,8 @@ export class BlockAssembler {
       case 'tool-call-delta': {
         const partial = this.ensure(chunk.index, 'tool-call')
         if (partial.block) return // closed by block-end; ignore stragglers
-        partial.toolCallId = chunk.id
+        // A terminal tool-call-delta may carry an empty id; keep the one we already have.
+        if (chunk.id) partial.toolCallId = chunk.id
         if (chunk.name) partial.toolCallName = chunk.name
         partial.toolCallArguments += chunk.argumentsDelta
         return
@@ -105,8 +109,28 @@ export class BlockAssembler {
     return partial
   }
 
+  /**
+   * The identity a tool-call block is settled with: the provider id accumulated
+   * from deltas when one was ever non-empty, otherwise one stable anonymous id
+   * minted per partial block so repeated reads stay idempotent and distinct
+   * calls never collide.
+   */
+  private toolCallIdentity(partial: PartialBlock): ToolCallId {
+    if (partial.toolCallId) return partial.toolCallId
+    partial.anonId ??= brandString<ToolCallId>(`call-anon-${randomUUID()}`)
+    return partial.anonId
+  }
+
   private assemble(partial: PartialBlock, index: number): ContentBlock {
-    if (partial.block) return partial.block
+    if (partial.block) {
+      // When a block-end tool-call carries an empty id (a streaming-protocol
+      // artefact of gateways that omit the call identity), settle it with the
+      // accumulated or minted identity instead of persisting an empty id.
+      if (partial.block.type === 'tool-call' && !partial.block.id) {
+        return { ...partial.block, id: this.toolCallIdentity(partial) }
+      }
+      return partial.block
+    }
     switch (partial.blockType) {
       case 'text': return { type: 'text', text: partial.text }
       case 'reasoning': return { type: 'reasoning', text: partial.text }

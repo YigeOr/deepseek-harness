@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto'
 import { SessionFormatError, SessionFormatUnsupportedMigrationError, defineSessionFormatMigration, sessionFormatCount } from '@deepseek-ai/dsh-session-format'
 import type { SessionFormatEvent, SessionFormatEventRun, SessionFormatJsonObject, SessionFormatJsonValue, SessionFormatMigrationContext, SessionFormatMigrationStage, SessionFormatMigrationStageInput } from '@deepseek-ai/dsh-session-format'
 import { assertReleasedV2Header } from '@deepseek-ai/dsh-session-format-v1-to-v2'
-import { assertEvent, canonicalizeTransformedEvent, record, SURFACE_TYPES } from './payload.ts'
+import { assertEvent, canonicalizeTransformedEvent, record, repairV2StreamEmptyToolCallIds, SURFACE_TYPES } from './payload.ts'
 import { remapEvent } from './references.ts'
 import { assertReleasedV3Header } from './validation.ts'
 
@@ -43,6 +43,7 @@ class ReleasedV2ToV3Stage implements SessionFormatMigrationStage {
 
   transformEvent(event: SessionFormatEvent, context: SessionFormatMigrationContext): void {
     if (event.seq !== this.mapping.length) throw new SessionFormatError('format v2 source events must be dense')
+    repairV2StreamEmptyToolCallIds(event)
     assertEvent(event, 2)
     this.observeMessageIds(event)
     let source = event

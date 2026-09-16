@@ -110,6 +110,35 @@ describe('BlockAssembler', () => {
     ])
   })
 
+  it('keeps the provider id from deltas when the final delta and block-end carry an empty id', () => {
+    const assembler = new BlockAssembler()
+    assembler.push({ type: 'block-start', index: 0, blockType: 'tool-call' })
+    assembler.push({ type: 'tool-call-delta', index: 0, id: ToolCallId('call_real'), name: 'bash', argumentsDelta: '{}' })
+    // Terminal delta repeats the identity as an empty string — means "unchanged".
+    assembler.push({ type: 'tool-call-delta', index: 0, id: ToolCallId(''), name: 'bash', argumentsDelta: '' })
+    assembler.push({ type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(''), name: 'bash', arguments: '{}' } })
+    expect(assembler.blocks()).toEqual([
+      { type: 'tool-call', id: ToolCallId('call_real'), name: 'bash', arguments: '{}' },
+    ])
+  })
+
+  it('mints one stable anonymous id per block when no delta ever carried an id', () => {
+    const assembler = new BlockAssembler()
+    assembler.push({ type: 'block-start', index: 0, blockType: 'tool-call' })
+    assembler.push({ type: 'tool-call-delta', index: 0, id: ToolCallId(''), name: 'bash', argumentsDelta: '{}' })
+    assembler.push({ type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(''), name: 'bash', arguments: '{}' } })
+    assembler.push({ type: 'block-start', index: 1, blockType: 'tool-call' })
+    assembler.push({ type: 'tool-call-delta', index: 1, id: ToolCallId(''), name: 'read', argumentsDelta: '{}' })
+    assembler.push({ type: 'block-end', index: 1, block: { type: 'tool-call', id: ToolCallId(''), name: 'read', arguments: '{}' } })
+    const blocks = assembler.blocks()
+    expect(blocks).toHaveLength(2)
+    const ids = (blocks as Array<{ type: 'tool-call'; id: string }>).map(block => block.id)
+    for (const id of ids) expect(id).toMatch(/^call-anon-[0-9a-f-]{36}$/u)
+    expect(ids).toEqual([...new Set(ids)])
+    // Repeated reads stay idempotent.
+    expect(assembler.blocks()).toEqual(blocks)
+  })
+
   it('exposes usage via the getter when a usage chunk was received', () => {
     const assembler = new BlockAssembler()
     assembler.push({ type: 'text-delta', index: 0, text: 'msg' })

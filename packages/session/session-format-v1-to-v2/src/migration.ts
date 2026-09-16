@@ -545,16 +545,121 @@ function streamOf(group: AttemptGroup) {
   return group.stream.map(({ record }) => record) as unknown as SessionFormatJsonValue
 }
 
+/**
+ * Repair empty tool-call ids in block-end stream chunks that originate from
+ * streaming protocols where the adapter emits tool-call deltas with an empty
+ * id.  The authoritative id is the one recorded in the settled message content
+ * (which tool dispatch and tool/result events also reference), so when the
+ * content and the stream carry the same number of tool calls the ids are
+ * zipped positionally.  Otherwise the id is recovered from a preceding packed
+ * {@code tool-call-chunks} record, with a synthetic per-index fallback so that
+ * downstream format validators accept the stream.
+ *
+ * @param stream - flushed attempt stream, mutated in place.
+ * @param content - settled message content, when the attempt has one.
+ * @returns repaired content when a content tool-call id was empty; otherwise undefined.
+ */
+function repairAttemptToolCallIds(
+  stream: Array<{ record: AssistantStreamRecord; lastTime: number }>,
+  content: SessionFormatJsonValue | undefined,
+): SessionFormatJsonValue[] | undefined {
+  // Collect block-index → id from packed tool-call-chunks records.
+  const packedIds = new Map<number, string>()
+  for (const entry of stream) {
+    if (entry.record.type === 'tool-call-chunks') {
+      packedIds.set(entry.record.index, entry.record.id)
+    }
+  }
+  // Content tool-call blocks in message order.
+  const contentCalls: Array<Record<string, unknown>> = []
+  if (Array.isArray(content)) {
+    for (const block of content as readonly SessionFormatJsonValue[]) {
+      if (typeof block !== 'object' || block === null || Array.isArray(block)) continue
+      const candidate = block as unknown as Record<string, unknown>
+      if (candidate['type'] === 'tool-call') contentCalls.push(candidate)
+    }
+  }
+  // Stream block-end tool-call entries in stream order.
+  const blockEnds: Array<{
+    entry: { record: AssistantStreamRecord; lastTime: number }
+    chunk: Record<string, unknown>
+    block: Record<string, unknown>
+    index: number
+  }> = []
+  for (const entry of stream) {
+    if (entry.record.type !== 'chunk') continue
+    const recordValue = entry.record as unknown as Record<string, unknown>
+    const chunk = recordValue['chunk']
+    if (typeof chunk !== 'object' || chunk === null || Array.isArray(chunk)) continue
+    const chunkRecord = chunk as Record<string, unknown>
+    if (chunkRecord['type'] !== 'block-end') continue
+    const block = chunkRecord['block']
+    if (typeof block !== 'object' || block === null || Array.isArray(block)) continue
+    const blockRecord = block as Record<string, unknown>
+    if (blockRecord['type'] !== 'tool-call') continue
+    blockEnds.push({ entry, chunk: chunkRecord, block: blockRecord, index: chunkRecord['index'] as number })
+  }
+  const zip = contentCalls.length === blockEnds.length && blockEnds.length > 0
+  const repairedPositions: number[] = []
+  const repairedIds: string[] = []
+  let contentPosition = 0
+  for (const target of blockEnds) {
+    const streamId = typeof target.block['id'] === 'string' && target.block['id'] !== ''
+      ? target.block['id'] as string
+      : ''
+    const contentCall = zip ? contentCalls[contentPosition] : undefined
+    const position = contentPosition
+    contentPosition += 1
+    const contentId = contentCall !== undefined && typeof contentCall['id'] === 'string' && contentCall['id'] !== ''
+      ? contentCall['id'] as string
+      : ''
+    if (streamId !== '' && (contentCall === undefined || contentId !== '')) continue
+    // Prefer the authoritative content id, then the packed delta id, then a synthetic id.
+    const id = contentId !== '' ? contentId
+      : streamId !== '' ? streamId
+        : packedIds.get(target.index) ?? `call-${target.index}`
+    if (streamId === '') {
+      const recordValue = target.entry.record as unknown as Record<string, unknown>
+      target.entry.record = {
+        type: 'chunk',
+        time: recordValue['time'],
+        chunk: { ...target.chunk, block: { ...target.block, id } },
+      } as unknown as AssistantStreamRecord
+    }
+    if (contentId === '' && contentCall !== undefined) {
+      // A content tool call without an id must adopt the same repaired id so
+      // that replaying the stream reassembles exactly the settled content.
+      repairedPositions.push(position)
+      repairedIds.push(id)
+    }
+  }
+  if (repairedPositions.length === 0) return undefined
+  return (content as readonly SessionFormatJsonValue[]).map((block, position) => {
+    const slot = repairedPositions.indexOf(position)
+    if (slot === -1) return block
+    return { ...(block as unknown as Record<string, unknown>), id: repairedIds[slot] } as unknown as SessionFormatJsonValue
+  })
+}
+
 function messageEvent(source: SessionFormatEvent, group: AttemptGroup): SessionFormatEvent {
   const data = record(source.data)
+  flushAccumulator(group)
+  const message = record(data['message'])
+  const repairedContent = repairAttemptToolCallIds(group.stream, message['content'])
   const { sourceEventSeqs: _sourceEventSeqs, ...event } = source
   return {
     ...event,
-    data: { ...data, stream: streamOf(group) },
+    data: {
+      ...data,
+      ...(repairedContent === undefined ? {} : { message: { ...message, content: repairedContent } }),
+      stream: streamOf(group),
+    },
   }
 }
 
 function attemptEvent(group: AttemptGroup): SessionFormatEvent {
+  flushAccumulator(group)
+  repairAttemptToolCallIds(group.stream, undefined)
   return {
     type: 'assistant/attempt',
     seq: group.lastChunkSeq as number,
